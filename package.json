@@ -1,0 +1,39 @@
+{
+  "name": "devicedb",
+  "productName": "DeviceDB",
+  "version": "1.0.0",
+  "description": "Device inventory lookup (DNS / IP) with CSV import-export and a ServiceNow-ready REST API. Zero-dependency local web app; optional Electron shell for a future Windows desktop build.",
+  "main": "server.js",
+  "author": "General Atomics ITS",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node scripts/seed.js",
+    "seed:wipe": "node scripts/seed.js --wipe",
+    "electron": "electron ."
+  },
+  "build": {
+    "appId": "com.ga.devicedb",
+    "productName": "DeviceDB",
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "files": [
+      "main.js",
+      "server.js",
+      "src/**/*",
+      "renderer/**/*",
+      "package.json"
+    ]
+  }
+}

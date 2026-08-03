@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GA Asset Inventory</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="app">
+
+  <!-- Top bar -->
+  <div class="topbar">
+    <div class="brand">
+      <img class="logo" src="assets/GA-Logo.webp" alt="General Atomics" />
+      <div>
+        <h1>GA Asset Inventory</h1>
+      </div>
+    </div>
+
+    <div class="searchwrap">
+      <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+      <input id="search" type="text" spellcheck="false" autocomplete="off"
+             placeholder="Search by Name or IP address" />
+      <button id="clearSearch" title="Clear">✕</button>
+    </div>
+
+    <button class="btn" id="resetBtn"
+            title="Clear the search, sorting and any selection — back to the full list">Reset view</button>
+
+    <div class="spacer"></div>
+
+    <button class="btn info" id="infoBtn" disabled
+            title="Open the full record for the highlighted device">
+      <svg class="ico" viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="9"/><line x1="12" y1="11.4" x2="12" y2="16.8"/><line x1="12" y1="7.4" x2="12" y2="7.6"/>
+      </svg>
+      Info
+    </button>
+    <span class="divider"></span>
+    <button class="btn icon" id="refreshBtn" title="Update">⟳</button>
+    <button class="btn primary" id="addBtn">＋ Add Device</button>
+    <button class="btn" id="importBtn">Import CSV</button>
+    <input type="file" id="importFile" accept=".csv,text/csv" hidden />
+
+    <div class="dropdown">
+      <button class="btn" id="exportBtn">Export ▾</button>
+      <div class="menu" id="exportMenu">
+        <button data-mode="all">Export entire dataset</button>
+        <button data-mode="filtered" id="exportFiltered">Export current search results</button>
+        <button data-mode="selected" id="exportSelected">Export selected rows</button>
+        <div class="sep"></div>
+        <button data-mode="template">Download blank CSV template</button>
+      </div>
+    </div>
+
+    <button class="btn danger" id="deleteBtn" disabled>Delete</button>
+    <button class="btn icon" id="settingsBtn" title="Settings">⚙</button>
+  </div>
+
+  <!-- Grid -->
+  <div class="tablewrap">
+    <div id="gridScroll">
+      <div class="gridheader" id="gridHeader"></div>
+      <div id="gridInner"></div>
+      <div class="emptystate" id="emptyState" hidden>
+        <div class="big">No devices found</div>
+        <div id="emptyHint">Import a CSV or click “＋ Add Device” to get started.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="statusbar">
+    <span id="statCount">0 devices</span>
+    <span id="statSelected"></span>
+    <span class="spacer"></span>
+    <span id="statApi"><span class="dot green"></span><span id="statApiText">API</span></span>
+    <span class="path" id="statPath" title=""></span>
+  </div>
+</div>
+
+<!-- Detail / edit modal -->
+<div class="overlay" id="detailOverlay">
+  <div class="modal">
+    <header>
+      <h2 id="detailTitle">Device</h2>
+      <button class="x" id="detailClose">✕</button>
+    </header>
+    <div class="body">
+      <div class="fieldgrid" id="detailGrid"></div>
+      <div class="meta-line" id="detailMeta"></div>
+    </div>
+    <footer id="detailFooter">
+      <button class="btn danger" id="detailDelete">Delete</button>
+      <span class="spacer"></span>
+      <button class="btn" id="detailCancel" hidden>Cancel</button>
+      <button class="btn primary" id="detailEdit">Edit</button>
+      <button class="btn primary" id="detailSave" hidden>Save</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Import confirmation modal -->
+<div class="overlay" id="importOverlay">
+  <div class="modal narrow">
+    <header>
+      <h2>Import CSV</h2>
+      <button class="x" id="importClose">✕</button>
+    </header>
+    <div class="body">
+      <div class="statcards" id="importStats"></div>
+      <div class="hint" id="importMatchNote"></div>
+      <div class="dupbox" id="importExamples" hidden></div>
+
+      <div class="settings-section" style="margin-top:18px">
+        <h3>Devices already in the database</h3>
+        <label class="radio-row">
+          <input type="radio" name="importMode" value="update" checked />
+          <span>
+            <b>Update them</b>
+            <em>Overwrite the existing record with the values from this file. New devices are still added.</em>
+          </span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="importMode" value="skip" />
+          <span>
+            <b>Skip them</b>
+            <em>Leave existing records untouched and only add devices that aren't in the database yet.</em>
+          </span>
+        </label>
+        <label class="radio-row">
+          <input type="radio" name="importMode" value="reject" />
+          <span>
+            <b>Reject the whole file</b>
+            <em>Import nothing and show me the conflicts, so I can fix the file first.</em>
+          </span>
+        </label>
+        <div class="hint" style="margin-top:10px">
+          Devices in the database that aren't in this file are never touched — importing only adds and updates.
+        </div>
+      </div>
+    </div>
+    <footer>
+      <button class="btn" id="importCancel">Cancel</button>
+      <button class="btn primary" id="importConfirm">Import</button>
+    </footer>
+  </div>
+</div>
+
+<!-- Settings modal -->
+<div class="overlay" id="settingsOverlay">
+  <div class="modal narrow">
+    <header>
+      <h2>Settings</h2>
+      <button class="x" id="settingsClose">✕</button>
+    </header>
+    <div class="body">
+
+      <div class="settings-section">
+        <h3>Server</h3>
+        <div class="kv"><span>Database file</span><code id="infoDbPath">—</code></div>
+        <div class="kv"><span>API base URL</span><code id="infoApiUrl">—</code></div>
+        <div class="kv"><span>Version</span><code id="infoVersion">—</code></div>
+        <div class="hint">
+          The database location and port are set in <code>config.json</code> (or the
+          <code>DB_PATH</code> / <code>PORT</code> environment variables) and applied on restart.
+          The JSON API that powers this UI is the same one ServiceNow will consume:
+          <code>/api/lookup?term=…</code>, <code>/api/devices</code>, <code>/api/stats?groupBy=5</code>.
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3>Columns</h3>
+        <div class="hint" style="margin-bottom:8px">
+          Rename any of the 39 columns. Mark which column holds the <b>DNS name</b> and which holds
+          the <b>IP address</b> — those drive the fast lookup and are indexed. CSV imports must match
+          these names exactly (use the template export).
+        </div>
+        <table class="coltable">
+          <thead><tr><th>#</th><th>Column name</th><th>DNS</th><th>IP</th></tr></thead>
+          <tbody id="colTableBody"></tbody>
+        </table>
+      </div>
+
+    </div>
+    <footer>
+      <button class="btn" id="settingsCancel">Cancel</button>
+      <button class="btn primary" id="settingsSave">Save settings</button>
+    </footer>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="app.js"></script>
+</body>
+</html>
