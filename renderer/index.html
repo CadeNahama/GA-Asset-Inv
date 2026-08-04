@@ -47,7 +47,7 @@
       <button class="btn" id="exportBtn">Export ▾</button>
       <div class="menu" id="exportMenu">
         <button data-mode="all">Export entire dataset</button>
-        <button data-mode="filtered" id="exportFiltered">Export current search results</button>
+        <button data-mode="filtered" id="exportFiltered">Export current search/filter results</button>
         <button data-mode="selected" id="exportSelected">Export selected rows</button>
         <div class="sep"></div>
         <button data-mode="template">Download blank CSV template</button>
@@ -74,6 +74,7 @@
   <div class="statusbar">
     <span id="statCount">0 devices</span>
     <span id="statSelected"></span>
+    <span id="statFilters"></span>
     <span class="spacer"></span>
     <span id="statApi"><span class="dot green"></span><span id="statApiText">API</span></span>
     <span class="path" id="statPath" title=""></span>
@@ -190,6 +191,8 @@
     </footer>
   </div>
 </div>
+
+<div class="filterpop" id="filterPop" hidden></div>
 
 <div id="toasts"></div>
 <script src="app.js"></script>

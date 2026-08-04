@@ -1,20 +1,27 @@
 /**
- * DeviceDB — frontend. Talks to the server's JSON API over fetch (no
- * Electron IPC — the same code runs in any browser and inside a future
- * Electron shell). Virtualized grid, detail/edit modal, CSV import/export
- * via browser upload/download, light/dark theme.
+ * DeviceDB — frontend. Talks to the server's JSON API over fetch.
+ * Virtualized grid, detail/edit modal, CSV import/export via browser
+ * upload/download. Runs in any modern browser pointed at the server.
  */
 'use strict';
 
 const ROW_H = 36;
 const PAGE = 200; // rows fetched per windowed query
 
+// Columns (by stable API key, immune to renames) that get an Excel-style
+// "select one, several, or all" filter dropdown in their header cell.
+const FILTER_KEYS = new Set(['type', 'status', 'env', 'metal', 'netcolor', 'os']);
+
 const state = {
-  columns: [],       // [{pos, name, role}]
+  columns: [],       // [{pos, name, key, role}]
   search: '',
   // Search covers Name + DNS + IP. Set to true to widen it to all 39
   // columns (the old "All columns" toggle; the API still supports it).
   allCols: false,
+  // Column filters: { [pos]: string[] } — an entry only exists for a
+  // column the user has actually narrowed; "everything checked" has no
+  // entry at all, same as an Excel filter with "(Select All)" ticked.
+  filters: {},
   sortPos: 0,        // 0 = id order
   sortDir: 'ASC',
   total: 0,
@@ -31,6 +38,17 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const colId = (pos) => 'c' + String(pos).padStart(2, '0');
+
+/**
+ * The human label for a device — its hostname. Uses the column carrying the
+ * `dns` role rather than column 1, since column 1 isn't necessarily the name
+ * (in the GA schema it's Type).
+ */
+function deviceLabel(row) {
+  if (!row) return '';
+  const dns = state.columns.find((c) => c.role === 'dns') || state.columns[0];
+  return dns ? row[colId(dns.pos)] || '' : '';
+}
 
 /* ----------------------------------------------------------- api layer */
 
@@ -49,10 +67,13 @@ async function apiFetch(path, opts = {}) {
 const api = {
   meta: () => apiFetch('/api/meta'),
   columns: () => apiFetch('/api/columns'),
-  query: ({ search = '', allColumns = false, sortPos = 0, sortDir = 'ASC', offset = 0, limit = PAGE }) =>
-    apiFetch(`/api/devices?raw=1&q=${encodeURIComponent(search)}&all=${allColumns ? 1 : 0}` +
-             `&sort=${sortPos}&dir=${sortDir}&offset=${offset}&limit=${limit}`)
-      .then((d) => ({ total: d.total, rows: d.results })),
+  columnValues: (pos) => apiFetch(`/api/columns/${pos}/values`),
+  query: ({ search = '', allColumns = false, sortPos = 0, sortDir = 'ASC', offset = 0, limit = PAGE, filters = null }) => {
+    let url = `/api/devices?raw=1&q=${encodeURIComponent(search)}&all=${allColumns ? 1 : 0}` +
+              `&sort=${sortPos}&dir=${sortDir}&offset=${offset}&limit=${limit}`;
+    if (filters && Object.keys(filters).length) url += `&filters=${encodeURIComponent(JSON.stringify(filters))}`;
+    return apiFetch(url).then((d) => ({ total: d.total, rows: d.results }));
+  },
   get: (id) => apiFetch(`/api/devices/${id}?raw=1`),
   save: (id, values) => id
     ? apiFetch(`/api/devices/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values }) })
@@ -144,16 +165,176 @@ function buildHeader() {
       invalidate();
       updateStatus();
     });
+
+    if (FILTER_KEYS.has(c.key)) {
+      const fbtn = document.createElement('button');
+      fbtn.type = 'button';
+      fbtn.className = 'filter-ico' + (state.filters[c.pos] ? ' active' : '');
+      fbtn.title = state.filters[c.pos]
+        ? `${c.name} is filtered — click to change`
+        : `Filter ${c.name}`;
+      fbtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M4 5h16l-6 8v6l-4-2v-4z"/></svg>';
+      fbtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openFilterPop(c, fbtn);
+      });
+      cell.appendChild(fbtn);
+    }
     h.appendChild(cell);
   }
 }
+
+/* ------------------------------------------------------- column filters */
+
+const columnValuesCache = new Map(); // pos -> [{value,count}], refreshed each invalidate()
+let filterPopCol = null;             // column currently open in the popover, or null
+
+function closeFilterPop() {
+  $('filterPop').hidden = true;
+  filterPopCol = null;
+}
+
+function positionFilterPop(anchorEl) {
+  const pop = $('filterPop');
+  const r = anchorEl.getBoundingClientRect();
+  const maxLeft = window.innerWidth - 244;
+  pop.style.top = Math.round(r.bottom + 4) + 'px';
+  pop.style.left = Math.max(8, Math.min(Math.round(r.left - 200), maxLeft)) + 'px';
+}
+
+async function openFilterPop(col, anchorEl) {
+  if (filterPopCol && filterPopCol.pos === col.pos) { closeFilterPop(); return; }
+  filterPopCol = col;
+  const pop = $('filterPop');
+  pop.innerHTML = '<div class="fp-empty">Loading…</div>';
+  pop.hidden = false;
+  positionFilterPop(anchorEl);
+
+  let values;
+  try {
+    values = columnValuesCache.get(col.pos) || await invoke(api.columnValues(col.pos));
+    columnValuesCache.set(col.pos, values);
+  } catch (_) {
+    closeFilterPop();
+    return;
+  }
+  if (!filterPopCol || filterPopCol.pos !== col.pos) return; // closed/changed while awaiting
+
+  renderFilterPop(col, values);
+  positionFilterPop(anchorEl);
+}
+
+function renderFilterPop(col, values) {
+  const pop = $('filterPop');
+  const active = state.filters[col.pos] || null; // null = nothing narrowed (all shown)
+  const selected = new Set(active || values.map((v) => v.value));
+  pop.innerHTML = '';
+
+  const search = document.createElement('input');
+  search.type = 'text';
+  search.className = 'fp-search';
+  search.placeholder = `Search ${col.name}…`;
+  search.spellcheck = false;
+  pop.appendChild(search);
+
+  const list = document.createElement('div');
+  list.className = 'fp-list';
+
+  const allRow = document.createElement('label');
+  allRow.className = 'fp-row fp-all';
+  const allCb = document.createElement('input');
+  allCb.type = 'checkbox';
+  allCb.checked = selected.size === values.length;
+  allCb.indeterminate = selected.size > 0 && selected.size < values.length;
+  const allLabel = document.createElement('span');
+  allLabel.className = 'fp-label';
+  allLabel.textContent = '(Select All)';
+  allRow.appendChild(allCb);
+  allRow.appendChild(allLabel);
+  list.appendChild(allRow);
+
+  const rowCbs = [];
+  for (const v of values) {
+    const row = document.createElement('label');
+    row.className = 'fp-row';
+    row.dataset.text = (v.value || '(blanks)').toLowerCase();
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selected.has(v.value);
+    cb.addEventListener('change', () => {
+      if (cb.checked) selected.add(v.value); else selected.delete(v.value);
+      allCb.checked = selected.size === values.length;
+      allCb.indeterminate = selected.size > 0 && selected.size < values.length;
+    });
+    const label = document.createElement('span');
+    label.className = 'fp-label';
+    label.textContent = v.value === '' ? '(Blanks)' : v.value;
+    const count = document.createElement('span');
+    count.className = 'fp-count';
+    count.textContent = v.count.toLocaleString();
+    row.appendChild(cb); row.appendChild(label); row.appendChild(count);
+    list.appendChild(row);
+    rowCbs.push(cb);
+  }
+  allCb.addEventListener('change', () => {
+    if (allCb.checked) values.forEach((v) => selected.add(v.value));
+    else selected.clear();
+    rowCbs.forEach((cb) => { cb.checked = allCb.checked; });
+    allCb.indeterminate = false;
+  });
+  pop.appendChild(list);
+
+  search.addEventListener('input', () => {
+    const term = search.value.trim().toLowerCase();
+    list.querySelectorAll('.fp-row:not(.fp-all)').forEach((row) => {
+      row.style.display = !term || row.dataset.text.includes(term) ? 'flex' : 'none';
+    });
+  });
+
+  const footer = document.createElement('div');
+  footer.className = 'fp-footer';
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.className = 'btn';
+  clearBtn.textContent = 'Clear filter';
+  clearBtn.disabled = !active;
+  clearBtn.addEventListener('click', () => applyFilterPop(col, null));
+  const okBtn = document.createElement('button');
+  okBtn.type = 'button';
+  okBtn.className = 'btn primary';
+  okBtn.textContent = 'OK';
+  okBtn.addEventListener('click', () =>
+    applyFilterPop(col, selected.size === values.length ? null : [...selected]));
+  footer.appendChild(clearBtn);
+  footer.appendChild(okBtn);
+  pop.appendChild(footer);
+
+  search.focus();
+}
+
+function applyFilterPop(col, values) {
+  if (values) state.filters[col.pos] = values;
+  else delete state.filters[col.pos];
+  closeFilterPop();
+  $('gridScroll').scrollTop = 0;
+  invalidate();
+  updateStatus();
+}
+
+document.addEventListener('click', (e) => {
+  if (filterPopCol && !$('filterPop').contains(e.target)) closeFilterPop();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && filterPopCol) closeFilterPop();
+});
+window.addEventListener('resize', () => { if (filterPopCol) closeFilterPop(); });
 
 async function fetchPage(idx) {
   if (state.pages.has(idx) || state.pending.has(idx)) return;
   state.pending.add(idx);
   try {
     const { total, rows } = await invoke(api.query({
-      search: state.search, allColumns: state.allCols,
+      search: state.search, allColumns: state.allCols, filters: state.filters,
       sortPos: state.sortPos, sortDir: state.sortDir,
       offset: idx * PAGE, limit: PAGE,
     }));
@@ -257,8 +438,8 @@ function renderRows() {
 
   // Only claim "nothing here" once a query has actually come back.
   $('emptyState').hidden = state.total !== 0 || !state.loaded;
-  $('emptyHint').textContent = state.search
-    ? 'Nothing matches your search. Use “Reset view” to go back to the full list.'
+  $('emptyHint').textContent = (state.search || Object.keys(state.filters).length)
+    ? 'Nothing matches your search/filters. Use “Reset view” to go back to the full list.'
     : 'Import a CSV or click “＋ Add Device” to get started.';
 }
 
@@ -266,6 +447,7 @@ function invalidate() {
   state.pages.clear();
   state.pending.clear();
   state.loaded = false;
+  columnValuesCache.clear();
   // Row positions are only meaningful for one sort/filter; drop the anchor
   // so a later shift-click can't span a range that no longer exists.
   state.activeIndex = null;
@@ -319,7 +501,7 @@ async function selectRange(a, b) {
     ids.length = 0;
     for (let off = start; off <= end; off += 1000) {
       const { rows } = await invoke(api.query({
-        search: state.search, allColumns: state.allCols,
+        search: state.search, allColumns: state.allCols, filters: state.filters,
         sortPos: state.sortPos, sortDir: state.sortDir,
         offset: off, limit: Math.min(1000, end - off + 1),
       }));
@@ -371,7 +553,7 @@ function copyActiveRow() {
   const row = state.activeRow;
   if (!row) return;
   const values = state.columns.map((c) => row[colId(c.pos)] || '');
-  copyText(values.join('\t'), `Copied row: ${values[0] || 'device'} (${values.length} fields)`);
+  copyText(values.join('\t'), `Copied row: ${deviceLabel(row) || 'device'} (${values.length} fields)`);
 }
 
 // Cmd/Ctrl+C copies the highlighted row — unless the user has actually
@@ -407,19 +589,21 @@ document.addEventListener('keydown', (e) => {
 
 function updateStatus() {
   const n = state.total;
-  $('statCount').textContent = state.search
+  $('statCount').textContent = (state.search || Object.keys(state.filters).length)
     ? `${n.toLocaleString()} match${n === 1 ? '' : 'es'}`
     : `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
   const sel = state.selected.size;
   $('statSelected').textContent = sel ? `${sel.toLocaleString()} selected` : '';
   $('deleteBtn').disabled = sel === 0;
   $('exportSelected').disabled = sel === 0;
-  $('exportFiltered').disabled = !state.search;
+  const filterCount = Object.keys(state.filters).length;
+  $('exportFiltered').disabled = !state.search && !filterCount;
+  $('statFilters').textContent = filterCount ? `${filterCount} filter${filterCount === 1 ? '' : 's'} applied` : '';
 
   const active = state.activeRow;
   $('infoBtn').disabled = !active;
   $('infoBtn').title = active
-    ? `Open the full record for ${active[colId(state.columns[0].pos)] || 'this device'} (or press Enter)`
+    ? `Open the full record for ${deviceLabel(active) || 'this device'} (or press Enter)`
     : 'Select a row first, then open its full record';
 }
 
@@ -427,14 +611,14 @@ function toggleSelectAll(checked) {
   if (!checked) { state.selected.clear(); renderRows(); updateStatus(); return; }
   // Select everything matching the current filter (ids only, cheap).
   invoke(api.query({
-    search: state.search, allColumns: state.allCols,
+    search: state.search, allColumns: state.allCols, filters: state.filters,
     offset: 0, limit: 1000,
   })).then(async ({ total, rows }) => {
     rows.forEach((r) => state.selected.set(r.id, true));
     // Page through the rest if the filter matches more than one API page.
     for (let off = 1000; off < total; off += 1000) {
       const more = await invoke(api.query({
-        search: state.search, allColumns: state.allCols, offset: off, limit: 1000,
+        search: state.search, allColumns: state.allCols, filters: state.filters, offset: off, limit: 1000,
       }));
       more.rows.forEach((r) => state.selected.set(r.id, true));
     }
@@ -469,8 +653,10 @@ $('resetBtn').addEventListener('click', () => {
   state.search = '';
   state.sortPos = 0;
   state.sortDir = 'ASC';
+  state.filters = {};
   state.selected.clear();
   clearActive();
+  closeFilterPop();
   $('gridScroll').scrollTop = 0;
   $('gridScroll').scrollLeft = 0;
   invalidate();
@@ -484,7 +670,10 @@ $('infoBtn').addEventListener('click', () => {
   if (state.activeId) openDetail(state.activeId);
 });
 
-$('gridScroll').addEventListener('scroll', () => renderRows());
+$('gridScroll').addEventListener('scroll', () => {
+  renderRows();
+  if (filterPopCol) closeFilterPop();
+});
 window.addEventListener('resize', () => renderRows());
 
 /* ------------------------------------------------------- detail / edit */
@@ -502,9 +691,7 @@ async function openDetail(id, startEditing = false) {
   }
   if (!id) editMode = true;
 
-  $('detailTitle').textContent = id
-    ? (row[colId(state.columns[0].pos)] || 'Device')
-    : 'New Device';
+  $('detailTitle').textContent = id ? (deviceLabel(row) || 'Device') : 'New Device';
   $('detailDelete').hidden = !id;
   renderDetail(row);
   $('detailOverlay').classList.add('open');
@@ -561,7 +748,7 @@ $('detailSave').addEventListener('click', async () => {
   detailId = saved.id;
   editMode = false;
   renderDetail(saved);
-  $('detailTitle').textContent = saved[colId(state.columns[0].pos)] || 'Device';
+  $('detailTitle').textContent = deviceLabel(saved) || 'Device';
   $('detailDelete').hidden = false;
   invalidate();
 });
@@ -639,6 +826,7 @@ $('exportMenu').addEventListener('click', (e) => {
   if (mode === 'filtered') {
     params.set('q', state.search);
     params.set('all', state.allCols ? '1' : '0');
+    if (Object.keys(state.filters).length) params.set('filters', JSON.stringify(state.filters));
   }
   if (mode === 'selected') params.set('ids', [...state.selected.keys()].join(','));
   download('/api/export?' + params.toString());

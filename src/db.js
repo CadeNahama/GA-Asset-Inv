@@ -19,22 +19,16 @@ const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 
+const { COLUMNS, slugify } = require('./columns');
+
 const NUM_COLS = 39;
 const COL_IDS = Array.from({ length: NUM_COLS }, (_, i) =>
   'c' + String(i + 1).padStart(2, '0')
 );
 
-// Sensible defaults; every one of these is renameable in Settings.
-const DEFAULT_NAMES = [
-  'Name', 'DNS Name', 'IP Address', 'Type', 'Status', 'Application Service',
-  'Environment', 'Location', 'Datacenter', 'Rack', 'Operating System',
-  'OS Version', 'Manufacturer', 'Model', 'Serial Number', 'Asset Tag',
-  'Owner', 'Owner Group', 'Support Group', 'Business Unit', 'Criticality',
-  'CPU Cores', 'Memory (GB)', 'Storage (GB)', 'Virtual/Physical',
-  'Cluster', 'Domain', 'Subnet', 'VLAN', 'MAC Address',
-  'Last Patched', 'Install Date', 'Warranty Expiration', 'Cost Center',
-  'Compliance Status', 'Backup Status', 'Monitoring', 'Notes', 'Last Updated By'
-];
+// Display names come from the canonical schema in ./columns.js.
+// They stay renameable in Settings; the API `key` never changes.
+const DEFAULT_NAMES = COLUMNS.map((c) => c.name);
 
 let db = null;
 let currentPath = null;
@@ -87,6 +81,12 @@ function migrate() {
       name TEXT NOT NULL,
       role TEXT
     );
+    CREATE TABLE IF NOT EXISTS deletions (
+      device_id  INTEGER PRIMARY KEY,
+      deleted_at TEXT NOT NULL,
+      deleted_by TEXT NOT NULL DEFAULT '',
+      dns        TEXT NOT NULL DEFAULT ''
+    );
     CREATE TABLE IF NOT EXISTS devices (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ${COL_IDS.map((c) => `${c} TEXT NOT NULL DEFAULT ''`).join(',\n      ')},
@@ -95,24 +95,127 @@ function migrate() {
     );
   `);
 
-  // Seed column names on first run.
+  // Add the immutable API key column to databases created before it existed.
+  const hasKey = db.prepare("PRAGMA table_info(columns)").all()
+    .some((c) => c.name === 'key');
+  if (!hasKey) db.exec('ALTER TABLE columns ADD COLUMN key TEXT');
+
+  // Seed column definitions on first run.
   const count = db.prepare('SELECT COUNT(*) AS n FROM columns').get().n;
   if (count === 0) {
-    const ins = db.prepare('INSERT INTO columns (pos, name, role) VALUES (?, ?, ?)');
+    const ins = db.prepare('INSERT INTO columns (pos, name, key, role) VALUES (?, ?, ?, ?)');
     tx(() => {
-      for (let i = 0; i < NUM_COLS; i++) {
-        const role = i === 1 ? 'dns' : i === 2 ? 'ip' : null;
-        ins.run(i + 1, DEFAULT_NAMES[i], role);
-      }
+      for (const c of COLUMNS) ins.run(c.pos, c.name, c.key, c.role);
     });
+  } else {
+    // Backfill keys for pre-existing databases, deriving them from whatever
+    // the column is currently called. Existing keys are never touched.
+    const missing = db.prepare("SELECT pos, name FROM columns WHERE key IS NULL OR key = ''").all();
+    if (missing.length) {
+      const taken = new Set(
+        db.prepare("SELECT key FROM columns WHERE key IS NOT NULL AND key != ''").all().map((r) => r.key)
+      );
+      const upd = db.prepare('UPDATE columns SET key = ? WHERE pos = ?');
+      tx(() => {
+        for (const m of missing) {
+          let k = slugify(m.name);
+          let n = 2;
+          while (taken.has(k)) k = `${slugify(m.name)}_${n++}`; // guarantee uniqueness
+          taken.add(k);
+          upd.run(k, m.pos);
+        }
+      });
+    }
   }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_columns_key ON columns (key)');
   rebuildRoleIndexes();
 }
 
 /* ------------------------------------------------------------- columns */
 
 function getColumns() {
-  return db.prepare('SELECT pos, name, role FROM columns ORDER BY pos').all();
+  return db.prepare('SELECT pos, name, key, role FROM columns ORDER BY pos').all();
+}
+
+/** Resolve an API key (or a position number) to its physical c-column. */
+function colIdForKey(keyOrPos) {
+  const k = String(keyOrPos).trim();
+  if (/^\d+$/.test(k)) {
+    const pos = Number(k);
+    return pos >= 1 && pos <= NUM_COLS ? COL_IDS[pos - 1] : null;
+  }
+  const row = db.prepare('SELECT pos FROM columns WHERE key = ? COLLATE NOCASE').get(k);
+  return row ? COL_IDS[row.pos - 1] : null;
+}
+
+function columnByKey(keyOrPos) {
+  const k = String(keyOrPos).trim();
+  if (/^\d+$/.test(k)) return db.prepare('SELECT pos, name, key, role FROM columns WHERE pos = ?').get(Number(k)) || null;
+  return db.prepare('SELECT pos, name, key, role FROM columns WHERE key = ? COLLATE NOCASE').get(k) || null;
+}
+
+/**
+ * Apply a whole schema at once: [{pos, name, key, role}].
+ *
+ * Done in two phases inside one transaction because the new layout is often
+ * a PERMUTATION of the old one — setting column 1 to "Type" while column 4
+ * is still called "Type" would trip the uniqueness checks. So every column
+ * is parked on a temporary unique value first, then given its final one.
+ *
+ * Device data is never touched; only the labels above it.
+ */
+function applySchema(defs, { keys = false } = {}) {
+  const names = new Set();
+  const keySet = new Set();
+  for (const d of defs) {
+    const n = String(d.name || '').trim().toLowerCase();
+    if (!n) throw new Error(`Column ${d.pos} has an empty name.`);
+    if (names.has(n)) throw new Error(`Duplicate column name "${d.name}".`);
+    names.add(n);
+    if (keys) {
+      const k = slugify(d.key || d.name);
+      if (keySet.has(k)) throw new Error(`Duplicate column key "${k}".`);
+      keySet.add(k);
+    }
+  }
+
+  const park = db.prepare('UPDATE columns SET name = ?, key = ?, role = NULL WHERE pos = ?');
+  const setName = db.prepare('UPDATE columns SET name = ? WHERE pos = ?');
+  const setKey = db.prepare('UPDATE columns SET key = ? WHERE pos = ?');
+  const setRoleQ = db.prepare('UPDATE columns SET role = ? WHERE pos = ?');
+
+  tx(() => {
+    // Phase 1 — park everything on collision-proof temporaries.
+    for (const d of defs) park.run(`__tmp_name_${d.pos}`, `__tmp_key_${d.pos}`, d.pos);
+    // Phase 2 — final values.
+    for (const d of defs) {
+      setName.run(String(d.name).trim(), d.pos);
+      if (keys) setKey.run(slugify(d.key || d.name), d.pos);
+      if (d.role) setRoleQ.run(d.role, d.pos);
+    }
+  });
+
+  // Keys parked as temporaries must not survive when not resetting keys.
+  if (!keys) {
+    const stale = db.prepare("SELECT pos, name FROM columns WHERE key LIKE '__tmp_key_%'").all();
+    for (const s of stale) setKey.run(slugify(s.name), s.pos);
+  }
+
+  rebuildRoleIndexes();
+  return getColumns();
+}
+
+/**
+ * Change a column's API key. Deliberately separate from renaming: keys are
+ * contracts with ServiceNow/connectors, so changing one is an explicit act.
+ */
+function setColumnKey(pos, key) {
+  const k = slugify(key);
+  if (!k) throw new Error('Key cannot be empty.');
+  const clash = db.prepare('SELECT pos FROM columns WHERE key = ? AND pos != ?').get(k, pos);
+  if (clash) throw new Error(`Another column already uses the key "${k}".`);
+  db.prepare('UPDATE columns SET key = ? WHERE pos = ?').run(k, pos);
+  return getColumns();
 }
 
 function renameColumn(pos, name) {
@@ -153,17 +256,56 @@ function rebuildRoleIndexes() {
 /* --------------------------------------------------------------- query */
 
 /**
+ * Every distinct value currently in a column, with counts — powers the
+ * Excel-style "select one, several, or all" filter dropdown. Blanks sort
+ * last rather than first so the real values are what the user sees up top.
+ */
+function distinctValues(pos) {
+  if (!(pos >= 1 && pos <= NUM_COLS)) return [];
+  const col = COL_IDS[pos - 1];
+  return db.prepare(
+    `SELECT ${col} AS value, COUNT(*) AS count FROM devices
+     GROUP BY ${col} ORDER BY (${col} = '') ASC, ${col} COLLATE NOCASE ASC`
+  ).all();
+}
+
+/**
+ * Build a `col IN (...)` clause per filtered column, ANDed together.
+ * filters: { [pos]: string[] } — an entry only exists for columns the user
+ * has actually narrowed; a column with everything checked simply has no
+ * entry, same as an Excel filter with "(Select All)" ticked.
+ */
+function buildFilterClause(filters) {
+  const parts = [];
+  const params = [];
+  if (filters && typeof filters === 'object') {
+    for (const key of Object.keys(filters)) {
+      const pos = Number(key);
+      const values = filters[key];
+      if (!(pos >= 1 && pos <= NUM_COLS)) continue;
+      if (!Array.isArray(values) || !values.length) continue;
+      const col = COL_IDS[pos - 1];
+      parts.push(`${col} COLLATE NOCASE IN (${values.map(() => '?').join(',')})`);
+      params.push(...values.map(String));
+    }
+  }
+  return { clause: parts.join(' AND '), params };
+}
+
+/**
  * Windowed query for the virtualized table.
- * opts: { search, allColumns, sortPos, sortDir, offset, limit }
+ * opts: { search, allColumns, sortPos, sortDir, offset, limit, filters }
  * Search matches Name + DNS + IP columns by default (case-insensitive
- * substring); allColumns=true widens it to every column.
+ * substring); allColumns=true widens it to every column. filters narrows
+ * specific columns to a fixed set of values (see buildFilterClause).
  */
 function query(opts = {}) {
   const { search = '', allColumns = false, sortPos = 0, sortDir = 'ASC',
-          offset = 0, limit = 100 } = opts;
+          offset = 0, limit = 100, filters = null } = opts;
 
-  let where = '';
+  const whereParts = [];
   const params = [];
+
   const q = String(search).trim();
   if (q) {
     const like = `%${q}%`;
@@ -176,9 +318,14 @@ function query(opts = {}) {
       if (dns) targets.push(dns);
       if (ip) targets.push(ip);
     }
-    where = 'WHERE ' + targets.map((c) => `${c} LIKE ? COLLATE NOCASE`).join(' OR ');
+    whereParts.push('(' + targets.map((c) => `${c} LIKE ? COLLATE NOCASE`).join(' OR ') + ')');
     targets.forEach(() => params.push(like));
   }
+
+  const { clause: filterClause, params: filterParams } = buildFilterClause(filters);
+  if (filterClause) { whereParts.push(filterClause); params.push(...filterParams); }
+
+  const where = whereParts.length ? 'WHERE ' + whereParts.join(' AND ') : '';
 
   const sortCol = sortPos >= 1 && sortPos <= NUM_COLS ? COL_IDS[sortPos - 1] : 'id';
   const dir = String(sortDir).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
@@ -193,16 +340,48 @@ function query(opts = {}) {
   return { total, rows };
 }
 
-/** Exact lookup by DNS name or IP address (the headline feature). */
+/**
+ * Lookup by hostname or IP address (the headline feature).
+ *
+ * Exact match first — that hits the indexes and covers the normal case.
+ * If nothing matches, fall back to token matching, because the address
+ * column may legitimately hold several values in one cell
+ * ("10.1.2.3, 10.1.2.4" / semicolon / space / newline separated). The
+ * fallback only runs when the fast path found nothing, so the common
+ * case pays no cost.
+ */
 function lookup(term) {
   const t = String(term).trim();
   if (!t) return [];
   const dns = roleCol('dns'); const ip = roleCol('ip');
+
   const parts = []; const params = [];
   if (dns) { parts.push(`${dns} = ? COLLATE NOCASE`); params.push(t); }
   if (ip) { parts.push(`${ip} = ? COLLATE NOCASE`); params.push(t); }
   if (!parts.length) return [];
-  return db.prepare(`SELECT * FROM devices WHERE ${parts.join(' OR ')}`).all(...params);
+
+  const exact = db.prepare(`SELECT * FROM devices WHERE ${parts.join(' OR ')}`).all(...params);
+  if (exact.length) return exact;
+
+  // Token fallback: narrow with LIKE (so SQLite can still skip most rows),
+  // then confirm in JS that the term is a whole delimited value, not a
+  // coincidental substring — otherwise "10.1.2.3" would match "10.1.2.30".
+  const like = `%${t}%`;
+  const cand = [];
+  if (ip) cand.push(...db.prepare(`SELECT * FROM devices WHERE ${ip} LIKE ? COLLATE NOCASE`).all(like));
+  if (dns) cand.push(...db.prepare(`SELECT * FROM devices WHERE ${dns} LIKE ? COLLATE NOCASE`).all(like));
+
+  const wanted = t.toLowerCase();
+  const seen = new Set();
+  return cand.filter((r) => {
+    if (seen.has(r.id)) return false;
+    const fields = [ip && r[ip], dns && r[dns]].filter(Boolean);
+    const hit = fields.some((v) =>
+      String(v).split(/[,;|\s]+/).some((tok) => tok.trim().toLowerCase() === wanted)
+    );
+    if (hit) { seen.add(r.id); return true; }
+    return false;
+  });
 }
 
 function getDevice(id) {
@@ -228,8 +407,51 @@ function saveDevice(id, values, user) {
   return getDevice(Number(info.lastInsertRowid));
 }
 
-function deleteDevices(ids) {
+/**
+ * Delete devices, recording a tombstone for each.
+ *
+ * The tombstone is what lets a downstream sync (ServiceNow, Orion) learn
+ * that a device went away. Without it, decommissioned kit would linger in
+ * external dashboards forever, because a pull-based sync only ever sees
+ * rows that still exist.
+ */
+function deleteDevices(ids, user = '') {
+  const dnsCol = roleCol('dns');
+  const get = db.prepare('SELECT * FROM devices WHERE id = ?');
   const del = db.prepare('DELETE FROM devices WHERE id = ?');
+  const tomb = db.prepare(
+    `INSERT INTO deletions (device_id, deleted_at, deleted_by, dns)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(device_id) DO UPDATE SET deleted_at = excluded.deleted_at,
+       deleted_by = excluded.deleted_by, dns = excluded.dns`
+  );
+  const now = new Date().toISOString();
+  tx(() => {
+    for (const id of ids) {
+      const row = get.get(id);
+      tomb.run(id, now, user || '', row && dnsCol ? String(row[dnsCol] || '') : '');
+      del.run(id);
+    }
+  });
+  return ids.length;
+}
+
+/** Devices deleted since an ISO timestamp — for incremental external syncs. */
+function deletionsSince(iso) {
+  if (iso) {
+    return db.prepare(
+      'SELECT device_id AS id, deleted_at, deleted_by, dns FROM deletions WHERE deleted_at > ? ORDER BY deleted_at'
+    ).all(String(iso));
+  }
+  return db.prepare(
+    'SELECT device_id AS id, deleted_at, deleted_by, dns FROM deletions ORDER BY deleted_at'
+  ).all();
+}
+
+/** A device id reappearing (re-imported) should clear its tombstone. */
+function clearTombstones(ids) {
+  if (!ids || !ids.length) return 0;
+  const del = db.prepare('DELETE FROM deletions WHERE device_id = ?');
   tx(() => { ids.forEach((id) => del.run(id)); });
   return ids.length;
 }
@@ -378,12 +600,12 @@ function wipeDevices() {
 /* -------------------------------------------------------------- export */
 
 /** All matching rows (no paging) for CSV export. ids limits to selection. */
-function exportRows({ search = '', allColumns = false, ids = null } = {}) {
+function exportRows({ search = '', allColumns = false, ids = null, filters = null } = {}) {
   if (ids && ids.length) {
     const placeholders = ids.map(() => '?').join(',');
     return db.prepare(`SELECT * FROM devices WHERE id IN (${placeholders}) ORDER BY id`).all(...ids);
   }
-  const { rows } = query({ search, allColumns, offset: 0, limit: 100000000 });
+  const { rows } = query({ search, allColumns, filters, offset: 0, limit: 100000000 });
   return rows;
 }
 
@@ -409,6 +631,8 @@ module.exports = {
   NUM_COLS, COL_IDS, DEFAULT_NAMES,
   open, close, getPath,
   getColumns, renameColumn, setRole,
+  colIdForKey, columnByKey, setColumnKey, applySchema,
+  deletionsSince, clearTombstones, distinctValues,
   query, lookup, getDevice,
   saveDevice, deleteDevices, insertMany, wipeDevices,
   analyzeImport, importRows, matchColumnName,

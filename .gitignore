@@ -17,8 +17,5 @@ data/
 *.log
 .vscode/
 .idea/
+.claude/
 
-# Electron build output
-dist/
-out/
-release/

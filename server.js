@@ -6,8 +6,8 @@
  * Serves the UI (renderer/) and a full read/write JSON API. Zero external
  * dependencies — plain node:http + node:sqlite (Node 22.5+ required).
  *
- * The same server is what a future Electron shell (main.js) starts and
- * what ServiceNow will call for lookups/stats. One backbone, many fronts.
+ * Deploy as a web app: run this process and point browsers (and later
+ * ServiceNow) at the same host/port. One server, one API, one UI.
  *
  * Config (optional, all overridable by env vars):
  *   config.json next to this file: { "port": 8422, "host": "127.0.0.1", "dbPath": "" }
@@ -19,7 +19,8 @@
  *   GET    /api/columns                         → configured column names/roles
  *   PUT    /api/columns/:pos                    → { name } rename column
  *   PUT    /api/columns/:pos/role               → { role: 'dns'|'ip' }
- *   GET    /api/devices?q=&all=&sort=&dir=&limit=&offset=   → paged list
+ *   GET    /api/columns/:pos/values             → distinct values + counts (filter dropdown)
+ *   GET    /api/devices?q=&all=&sort=&dir=&limit=&offset=&filters=   → paged list
  *   GET    /api/devices/:id                     → single device (raw c01..c39)
  *   POST   /api/devices                         → { values } create
  *   PUT    /api/devices/:id                     → { values } update
@@ -27,8 +28,11 @@
  *   GET    /api/lookup?term=host-or-ip          → exact DNS/IP lookup (friendly names)
  *   GET    /api/stats?groupBy=<pos>             → totals + group counts (metrics)
  *   POST   /api/import  (text/csv body)         → strict validate + insert (all-or-nothing)
- *   GET    /api/export?mode=all|filtered|selected&q=&all=&ids=   → CSV download
+ *   GET    /api/export?mode=all|filtered|selected&q=&all=&ids=&filters=   → CSV download
  *   GET    /api/template                        → blank CSV template download
+ *
+ * filters= is a JSON-encoded { "<colPos>": ["value1", "value2", ...] } map —
+ * an Excel-style "narrow this column to these values" filter, ANDed with q=.
  */
 'use strict';
 
@@ -122,6 +126,16 @@ async function readJsonBody(req) {
   catch (_) { throw new Error('Request body is not valid JSON.'); }
 }
 
+/** Parse the filters= query param: JSON { "<colPos>": [values...] }, or null. */
+function parseFilters(q) {
+  const raw = q.get('filters');
+  if (!raw) return null;
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === 'object' ? obj : null;
+  } catch (_) { return null; }
+}
+
 /** Map raw row (c01..c39) → display-named object for external consumers. */
 function friendly(row) {
   const cols = db.getColumns();
@@ -178,6 +192,9 @@ async function handleApi(req, res, u) {
     const { role } = await readJsonBody(req);
     return sendJson(res, 200, db.setRole(Number(parts[2]), role));
   }
+  if (parts[1] === 'columns' && parts[3] === 'values' && method === 'GET') {
+    return sendJson(res, 200, db.distinctValues(Number(parts[2])));
+  }
 
   // -------- lookup / stats
   if (parts[1] === 'lookup' && method === 'GET') {
@@ -199,6 +216,7 @@ async function handleApi(req, res, u) {
       sortDir: q.get('dir') || 'ASC',
       offset: Number(q.get('offset')) || 0,
       limit: Math.min(Number(q.get('limit')) || 100, 1000),
+      filters: parseFilters(q),
     });
     return sendJson(res, 200, {
       total,
@@ -208,7 +226,7 @@ async function handleApi(req, res, u) {
   if (parts[1] === 'devices' && parts[2] === 'delete' && method === 'POST') {
     const { ids } = await readJsonBody(req);
     if (!Array.isArray(ids) || !ids.length) throw new Error('ids[] required.');
-    return sendJson(res, 200, { deleted: db.deleteDevices(ids.map(Number)) });
+    return sendJson(res, 200, { deleted: db.deleteDevices(ids.map(Number), currentUser()) });
   }
   if (parts[1] === 'devices' && parts.length === 3 && method === 'GET') {
     const row = db.getDevice(Number(parts[2]));
@@ -254,7 +272,7 @@ async function handleApi(req, res, u) {
     const ids = (q.get('ids') || '').split(',').map(Number).filter(Boolean);
     const rows = db.exportRows(
       mode === 'selected' ? { ids }
-      : mode === 'filtered' ? { search: String(q.get('q') || ''), allColumns: q.get('all') === '1' }
+      : mode === 'filtered' ? { search: String(q.get('q') || ''), allColumns: q.get('all') === '1', filters: parseFilters(q) }
       : {}
     ).map((r) => db.COL_IDS.map((c) => r[c]));
     const header = db.getColumns().map((c) => c.name);
@@ -292,7 +310,7 @@ function createServer() {
   });
 }
 
-/** Start the app. Used by `node server.js` and by the Electron shell. */
+/** Start the HTTP server and open the database. */
 function start({ port = config.port, host = config.host, dbPath = config.dbPath } = {}) {
   db.open(dbPath);
   const server = createServer();
