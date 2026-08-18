@@ -29,10 +29,21 @@ const DB_PATH = process.env.DB_PATH || file.dbPath ||
 
 /* ---------------------------------------------------------- generators */
 
+/**
+ * Deterministic PRNG (mulberry32) so runs are reproducible.
+ *
+ * NOT a plain LCG: `seed * 1103515245` exceeds Number.MAX_SAFE_INTEGER, so
+ * the low bits are lost to float rounding before the bitwise mask sees them.
+ * That collapses the effective period — the previous implementation produced
+ * only ~300 distinct devices no matter how many rows were requested.
+ * mulberry32 uses Math.imul, which is exact 32-bit multiplication.
+ */
 let seedVal = 42;
-function rnd() { // deterministic PRNG so runs are reproducible
-  seedVal = (seedVal * 1103515245 + 12345) & 0x7fffffff;
-  return seedVal / 0x7fffffff;
+function rnd() {
+  seedVal = (seedVal + 0x6d2b79f5) | 0;
+  let t = Math.imul(seedVal ^ (seedVal >>> 15), 1 | seedVal);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
 }
 const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
 const int = (lo, hi) => lo + Math.floor(rnd() * (hi - lo + 1));
@@ -85,6 +96,18 @@ function futureDate(daysMax) {
   return new Date(Date.now() + int(30, daysMax) * 86400000).toISOString().slice(0, 10);
 }
 
+// Hostnames are the dedup / coalesce key everywhere downstream, so they must
+// be unique. Collisions are resolved with a numeric suffix rather than left
+// to chance.
+const usedNames = new Set();
+function uniqueName(base) {
+  let name = base;
+  let n = 2;
+  while (usedNames.has(name.toLowerCase())) name = `${base}-${n++}`;
+  usedNames.add(name.toLowerCase());
+  return name;
+}
+
 function makeDevice(i) {
   const type = pick(TYPES);
   const app = pick(APPS);
@@ -92,9 +115,9 @@ function makeDevice(i) {
   const mfg = virtual ? 'VMware' : pick(MFG);
 
   // Mix of structured GA-style hostnames and opaque legacy names.
-  const host = chance(0.75)
+  const host = uniqueName(chance(0.75)
     ? `ga-${app.toLowerCase().replace(/[^a-z]+/g, '').slice(0, 6)}-${String(int(1, 999)).padStart(3, '0')}${pick(['a', 'b', 'p', 'd', ''])}`
-    : rndStr(LETTERS, int(4, 8)) + String(int(10, 99));
+    : rndStr(LETTERS, int(4, 8)) + String(int(10, 99)));
 
   // A minority of devices carry several addresses in one cell, which is
   // exactly the case the lookup token-matching has to survive.

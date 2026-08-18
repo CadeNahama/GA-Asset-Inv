@@ -41,11 +41,18 @@ function escapeField(v) {
   return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-/** Serialize header + rows to CSV text (CRLF, with BOM for Excel). */
-function serialize(header, rows) {
+/**
+ * Serialize header + rows to CSV text (CRLF).
+ *
+ * A UTF-8 BOM is written by default so Excel opens the file with the right
+ * encoding. Pass { bom: false } for machine consumers — ServiceNow's import
+ * does NOT strip it, and would name the first column "﻿name" instead of
+ * "name", silently breaking that one field's auto-mapping.
+ */
+function serialize(header, rows, { bom = true } = {}) {
   const lines = [header.map(escapeField).join(',')];
   for (const r of rows) lines.push(r.map(escapeField).join(','));
-  return '﻿' + lines.join('\r\n') + '\r\n';
+  return (bom ? '﻿' : '') + lines.join('\r\n') + '\r\n';
 }
 
 /**
