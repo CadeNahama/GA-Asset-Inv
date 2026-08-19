@@ -137,23 +137,6 @@ function getColumns() {
   return db.prepare('SELECT pos, name, key, role FROM columns ORDER BY pos').all();
 }
 
-/** Resolve an API key (or a position number) to its physical c-column. */
-function colIdForKey(keyOrPos) {
-  const k = String(keyOrPos).trim();
-  if (/^\d+$/.test(k)) {
-    const pos = Number(k);
-    return pos >= 1 && pos <= NUM_COLS ? COL_IDS[pos - 1] : null;
-  }
-  const row = db.prepare('SELECT pos FROM columns WHERE key = ? COLLATE NOCASE').get(k);
-  return row ? COL_IDS[row.pos - 1] : null;
-}
-
-function columnByKey(keyOrPos) {
-  const k = String(keyOrPos).trim();
-  if (/^\d+$/.test(k)) return db.prepare('SELECT pos, name, key, role FROM columns WHERE pos = ?').get(Number(k)) || null;
-  return db.prepare('SELECT pos, name, key, role FROM columns WHERE key = ? COLLATE NOCASE').get(k) || null;
-}
-
 /**
  * Apply a whole schema at once: [{pos, name, key, role}].
  *
@@ -202,19 +185,6 @@ function applySchema(defs, { keys = false } = {}) {
   }
 
   rebuildRoleIndexes();
-  return getColumns();
-}
-
-/**
- * Change a column's API key. Deliberately separate from renaming: keys are
- * contracts with ServiceNow/connectors, so changing one is an explicit act.
- */
-function setColumnKey(pos, key) {
-  const k = slugify(key);
-  if (!k) throw new Error('Key cannot be empty.');
-  const clash = db.prepare('SELECT pos FROM columns WHERE key = ? AND pos != ?').get(k, pos);
-  if (clash) throw new Error(`Another column already uses the key "${k}".`);
-  db.prepare('UPDATE columns SET key = ? WHERE pos = ?').run(k, pos);
   return getColumns();
 }
 
@@ -436,26 +406,6 @@ function deleteDevices(ids, user = '') {
   return ids.length;
 }
 
-/** Devices deleted since an ISO timestamp — for incremental external syncs. */
-function deletionsSince(iso) {
-  if (iso) {
-    return db.prepare(
-      'SELECT device_id AS id, deleted_at, deleted_by, dns FROM deletions WHERE deleted_at > ? ORDER BY deleted_at'
-    ).all(String(iso));
-  }
-  return db.prepare(
-    'SELECT device_id AS id, deleted_at, deleted_by, dns FROM deletions ORDER BY deleted_at'
-  ).all();
-}
-
-/** A device id reappearing (re-imported) should clear its tombstone. */
-function clearTombstones(ids) {
-  if (!ids || !ids.length) return 0;
-  const del = db.prepare('DELETE FROM deletions WHERE device_id = ?');
-  tx(() => { ids.forEach((id) => del.run(id)); });
-  return ids.length;
-}
-
 /** Bulk insert used by CSV import / seeding. rowsOfArrays: string[39][] */
 function insertMany(rowsOfArrays, user) {
   const now = new Date().toISOString();
@@ -631,8 +581,7 @@ module.exports = {
   NUM_COLS, COL_IDS, DEFAULT_NAMES,
   open, close, getPath,
   getColumns, renameColumn, setRole,
-  colIdForKey, columnByKey, setColumnKey, applySchema,
-  deletionsSince, clearTombstones, distinctValues,
+  applySchema, distinctValues,
   query, lookup, getDevice,
   saveDevice, deleteDevices, insertMany, wipeDevices,
   analyzeImport, importRows, matchColumnName,

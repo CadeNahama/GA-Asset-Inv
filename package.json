@@ -1,11 +1,10 @@
 {
   "name": "devicedb",
-  "productName": "DeviceDB",
   "version": "1.0.0",
   "description": "Device inventory lookup (DNS / IP) with CSV import-export and a ServiceNow-ready REST API. Zero-dependency Node web app — run the server and open it in a browser.",
   "main": "server.js",
   "author": "General Atomics ITS",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "engines": {
     "node": ">=22.5.0"
   },

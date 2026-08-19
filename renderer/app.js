@@ -38,6 +38,8 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const colId = (pos) => 'c' + String(pos).padStart(2, '0');
+/** <b> element with safe (non-HTML) text — for building DOM nodes from untrusted strings. */
+const boldEl = (text) => { const b = document.createElement('b'); b.textContent = String(text); return b; };
 
 /**
  * The human label for a device — its hostname. Uses the column carrying the
@@ -866,10 +868,15 @@ $('importFile').addEventListener('change', async () => {
     <div class="card new"><div class="n">${a.newCount.toLocaleString()}</div><div class="l">new device${a.newCount === 1 ? '' : 's'} to add</div></div>
     <div class="card dup"><div class="n">${a.dupCount.toLocaleString()}</div><div class="l">already in the database</div></div>
     <div class="card"><div class="n">${a.total.toLocaleString()}</div><div class="l">rows in file</div></div>`;
-  $('importMatchNote').innerHTML =
-    `Devices are matched on <b>${a.matchColumn}</b> (case-insensitive).` +
-    (a.dupInFile ? ` <b>${a.dupInFile}</b> row(s) are also duplicated within the file itself.` : '') +
-    (a.blankKey ? ` ${a.blankKey} row(s) have a blank ${a.matchColumn} and will always be added as new.` : '');
+  const note = $('importMatchNote');
+  note.textContent = '';
+  note.append('Devices are matched on ', boldEl(a.matchColumn), ' (case-insensitive).');
+  if (a.dupInFile) {
+    note.append(' ', boldEl(a.dupInFile), ' row(s) are also duplicated within the file itself.');
+  }
+  if (a.blankKey) {
+    note.append(` ${a.blankKey} row(s) have a blank ${a.matchColumn} and will always be added as new.`);
+  }
   $('importExamples').hidden = !a.examples.length;
   $('importExamples').textContent = a.examples.length
     ? 'Already present: ' + a.examples.join(', ') + (a.dupCount > a.examples.length ? ', …' : '')
